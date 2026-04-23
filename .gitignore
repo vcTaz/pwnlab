@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+*.inp
+*.fifo
+/tmp/pwnlab_*
+.pwnlab.toml
+exploit_*.py

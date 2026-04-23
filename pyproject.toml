@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pwnlab"
+version = "0.1.0"
+description = "General-purpose i386 binary exploitation CLI"
+requires-python = ">=3.11"
+dependencies = ["pwntools", "ROPgadget"]
+
+[project.scripts]
+pwnlab = "pwnlab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
