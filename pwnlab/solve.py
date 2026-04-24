@@ -278,7 +278,7 @@ def _run_with_payload(
 ) -> int:
     """Write payload (already framed for input_mode), run binary, return exit code."""
     wrapper = cfg.wrapper_parts()
-    env = dict(cfg.env)
+    env = {**os.environ, **cfg.env}
 
     if input_mode == "file-size-data":
         framed = str(len(raw_payload)).encode() + b" " + raw_payload + b"\n"
@@ -317,7 +317,7 @@ def _run_and_capture(
 ) -> tuple[int, str]:
     """Like _run_with_payload but also returns stdout+stderr."""
     wrapper = cfg.wrapper_parts()
-    env = dict(cfg.env)
+    env = {**os.environ, **cfg.env}
 
     if input_mode == "file-size-data":
         framed = str(len(raw_payload)).encode() + b" " + raw_payload + b"\n"
