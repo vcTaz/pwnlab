@@ -131,24 +131,69 @@ pyenv install --force 3.11.9
 
 **Fix B — no sudo on a university/shared machine:**
 
-Check whether the system Python already has curses support:
+First check whether the system Python already has curses support:
 
 ```bash
 python3 -c "import curses; print('OK')"
 ```
 
-If that prints `OK`, use the system Python instead of your pyenv one:
+If that prints `OK`, install pwntools and pwnlab under the system Python.
+Use `pip3` (not `pip` — `pip` may point to your broken pyenv):
 
 ```bash
-# Install pwntools for the system Python
 pip3 install --user pwntools
+cd /path/to/pwnlab
+pip3 install --user -e .
 
-# Run exploits with the system Python
-python3 exploit_bin.0.py
+# Make sure ~/.local/bin is in your PATH
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-If `python3` also fails the check, ask your sysadmin to install
-`libncurses5-dev` and either recompile Python or install pwntools system-wide.
+Now `pwnlab` runs under system Python, so both the tool and the `run`
+command inside it work correctly.
+
+**Fix C — system Python also lacks curses (use Miniconda):**
+
+Miniconda ships pre-built Python binaries that always include `_curses`.
+No sudo required — it installs entirely under your home directory.
+
+```bash
+# 1. Download the installer (run from your working directory)
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+
+# 2. Install silently into ~/miniconda3
+bash Miniconda3-latest-Linux-x86_64.sh -b -p ~/miniconda3
+
+# 3. Add conda to PATH for this session
+export PATH="$HOME/miniconda3/bin:$PATH"
+
+# 4. Initialise conda so 'conda activate' works in future shells
+conda init
+source ~/.bashrc
+
+# 5. Create a dedicated environment
+conda create -n pwn python=3.11 -y
+conda activate pwn
+
+# 6. Install pwntools and pwnlab
+pip install pwntools
+cd /path/to/pwnlab
+pip install -e .
+```
+
+After the one-time setup, all future sessions only need:
+
+```bash
+conda activate pwn
+```
+
+> **Common pitfalls**
+> - Run `bash Miniconda3-...sh` from the directory where it was downloaded,
+>   not from `~/` unless you moved it there first.
+> - `conda activate` requires `conda init` + a shell reload (`source ~/.bashrc`)
+>   before it works — doing them in the same shell without sourcing won't help.
+> - `export PATH=...` only lasts for the current terminal session; after
+>   `conda init` + `source ~/.bashrc` you no longer need the manual export.
 
 ## GDB integration
 
