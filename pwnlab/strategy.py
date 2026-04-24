@@ -30,8 +30,18 @@ def _canary(r: ReconResult) -> bool:
     return r.security.canary == "present"
 
 
+_FMT_SYMS = frozenset({
+    "printf", "fprintf", "__fprintf", "vfprintf", "__vfprintf",
+    "snprintf", "__isoc99_printf",
+})
+
+
 def _has_fmt(r: ReconResult) -> bool:
-    return "printf" in r.imports or "fprintf" in r.imports or "snprintf" in r.imports
+    # Dynamic imports (dynamically linked binaries)
+    if any(s in r.imports for s in ("printf", "fprintf", "snprintf")):
+        return True
+    # Static function symbols (statically linked binaries have no dynamic imports)
+    return bool(_FMT_SYMS & set(r.functions.keys()))
 
 
 def _has_fork(r: ReconResult) -> bool:

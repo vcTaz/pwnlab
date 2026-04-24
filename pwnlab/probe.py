@@ -100,10 +100,17 @@ def detect_input_mode(binary: Path, cfg: Config, strings_found: dict | None = No
             rc_stdin is not None and rc_stdin != 0 and not out_stdin.strip()):
         return _detect_file_format(binary, cfg)
 
-    # 3. stdin: binary waits for input (timeout) or produced output on stdin
+    # 3. stdin: binary waits for input (timeout), or providing stdin data changes
+    # behavior compared to the no-args run.  A binary that produces identical
+    # output regardless of stdin (e.g. always prints "Congratulations!") is NOT
+    # a stdin-based binary — that would be a false positive.
     if rc_stdin is None:  # timed out = waiting for stdin
         return "stdin"
-    if rc_stdin == 0 or out_stdin.strip():
+    # Succeeded with stdin but failed without → stdin controls outcome
+    if rc_stdin == 0 and (rc_noargs is None or rc_noargs != 0):
+        return "stdin"
+    # Output changed → binary actually read the stdin data
+    if out_stdin.strip() and out_stdin.strip() != out_noargs.strip():
         return "stdin"
 
     return "unknown"
@@ -118,7 +125,8 @@ def _detect_file_format(binary: Path, cfg: Config) -> str:
         tmp = Path(f.name)
     try:
         cmd = wrapper + [str(binary), str(tmp)]
-        r = subprocess.run(cmd, capture_output=True, env=env, timeout=3)
+        # Provide probe stdin so interactive prompts (name, Enter) don't block.
+        r = subprocess.run(cmd, input=b"PROBE\n\n", capture_output=True, env=env, timeout=5)
         out = (r.stdout + r.stderr).decode("latin-1", errors="replace")
         # If binary outputs "size" or "record" or echoes "5" it understood the format
         if any(kw in out.lower() for kw in ("size", "record", "render", "5")):
@@ -134,7 +142,13 @@ def _detect_file_format(binary: Path, cfg: Config) -> str:
 # GDB probe for offset
 # ---------------------------------------------------------------------------
 
-def _gdb_script(binary: Path, input_path: Path, input_mode: str, cfg: Config) -> str:
+def _gdb_script(
+    binary: Path,
+    input_path: Path,
+    input_mode: str,
+    cfg: Config,
+    probe_stdin: Path | None = None,
+) -> str:
     eip = cfg.eip_register()
     lines = [
         "unset environment",
@@ -154,6 +168,10 @@ def _gdb_script(binary: Path, input_path: Path, input_mode: str, cfg: Config) ->
 
     if input_mode == "stdin":
         lines.append(f"run < {input_path}")
+    elif probe_stdin:
+        # File-based binary that also reads from stdin (interactive prompts).
+        # Redirect stdin so scanf/getchar calls don't block the GDB session.
+        lines.append(f"run {input_path} < {probe_stdin}")
     else:
         lines.append(f"run {input_path}")
 
@@ -180,8 +198,17 @@ def find_offset(
         f.write(payload)
         input_path = Path(f.name)
 
+    # For file-based binaries, always provide a probe stdin file so that any
+    # interactive prompts (scanf, getchar) are answered and don't block GDB.
+    probe_stdin: Path | None = None
+    if input_mode in ("file-raw", "file-size-data"):
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".probe_stdin", delete=False) as sf:
+            # Two lines: answer any name/prompt + press Enter to continue
+            sf.write(b"PROBE\n\n")
+            probe_stdin = Path(sf.name)
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".gdb", delete=False) as f:
-        f.write(_gdb_script(binary, input_path, input_mode, cfg))
+        f.write(_gdb_script(binary, input_path, input_mode, cfg, probe_stdin=probe_stdin))
         gdb_script_path = Path(f.name)
 
     try:
@@ -230,3 +257,5 @@ def find_offset(
     finally:
         input_path.unlink(missing_ok=True)
         gdb_script_path.unlink(missing_ok=True)
+        if probe_stdin:
+            probe_stdin.unlink(missing_ok=True)
