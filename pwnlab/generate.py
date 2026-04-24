@@ -91,7 +91,7 @@ def _shellcode(s: Strategy, cfg: Config) -> str:
         proc = f"p = process({cmd}, env={env_dict}, stdin=PTY)\n"
 
     esp_val = s.addresses.get("esp_at_overflow")
-    post_eip = any("post-EIP" in n for n in s.notes)
+    post_eip = bool(s.addresses.get("post_eip"))
 
     if cfg.target.arch == "i386":
         shellcode_block = (
