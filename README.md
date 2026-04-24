@@ -111,6 +111,45 @@ pwnlab config init
 pwnlab config show
 ```
 
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named '_curses'`
+
+pwntools requires the `_curses` C extension. This extension is compiled into
+Python when Python is built — if the ncurses development headers were not
+installed beforehand, the module is silently skipped.
+
+**Fix A — if you have sudo (or the headers are already installed):**
+
+```bash
+# 1. Install ncurses development headers
+sudo apt install libncurses5-dev libncursesw5-dev
+
+# 2. Recompile your Python version (replace 3.11.9 with your version)
+pyenv install --force 3.11.9
+```
+
+**Fix B — no sudo on a university/shared machine:**
+
+Check whether the system Python already has curses support:
+
+```bash
+python3 -c "import curses; print('OK')"
+```
+
+If that prints `OK`, use the system Python instead of your pyenv one:
+
+```bash
+# Install pwntools for the system Python
+pip3 install --user pwntools
+
+# Run exploits with the system Python
+python3 exploit_bin.0.py
+```
+
+If `python3` also fails the check, ask your sysadmin to install
+`libncurses5-dev` and either recompile Python or install pwntools system-wide.
+
 ## GDB integration
 
 The `gdb` command prints commands to paste into GDB so its environment
