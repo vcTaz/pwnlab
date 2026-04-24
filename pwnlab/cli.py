@@ -557,7 +557,7 @@ Full automatic pipeline:
         print(f"      {bold(self.strat.name)}")
 
         print(f"{bold('[5/5]')} Solving …")
-        res = solve_mod.solve(self.strat, self.r, self.cfg, verbose=verbose)
+        res = solve_mod.solve(self.strat, self.r, self.cfg, verbose=verbose, esp_at_crash=self._esp_at_crash)
         solve_mod.display(res)
         if "esp_at_overflow" in res.addresses:
             self.strat.addresses["esp_at_overflow"] = res.addresses["esp_at_overflow"]
